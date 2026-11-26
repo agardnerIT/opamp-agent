@@ -9,11 +9,13 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
-	"time"
 
 	"github.com/agardnerIT/opamp-agent/driver"
 	"github.com/open-telemetry/opamp-go/client"
@@ -21,10 +23,18 @@ import (
 	"github.com/open-telemetry/opamp-go/protobufs"
 )
 
+// statusReporter is the slice of the OpAMP client the remote-config pipeline
+// reports through. Narrow on purpose: the pipeline is testable against a
+// recording fake without standing up an OpAMP server.
+type statusReporter interface {
+	SetRemoteConfigStatus(*protobufs.RemoteConfigStatus) error
+	UpdateEffectiveConfig(ctx context.Context) error
+}
+
 // Options configure one bridge run.
 type Options struct {
-	ServerURL string        // OpAMP endpoint, ws(s):// or http(s)://
-	Token     string        // agent bearer token
+	ServerURL string // OpAMP endpoint, ws(s):// or http(s)://
+	Token     string // agent bearer token
 	// InstanceUIDFile persists this host's agent identity across restarts;
 	// created if missing. Default "instance.uid" in the working directory.
 	InstanceUIDFile string
@@ -84,6 +94,10 @@ func Run(ctx context.Context, opts Options, drv driver.Driver) error {
 	}
 
 	state := &bridgeState{drv: drv, agent: agent}
+	// The startup snapshot is what a withdrawal returns to: the files as the
+	// agent found them, before any server push. Take it before the first
+	// message can arrive.
+	state.startup = snapshotStartup(ident.OwnedFiles)
 
 	settings := types.StartSettings{
 		OpAMPServerURL: opts.ServerURL,
@@ -124,9 +138,28 @@ func Run(ctx context.Context, opts Options, drv driver.Driver) error {
 // ---- remote-config pipeline: snapshot → render → apply → verify → LKG ----
 
 type bridgeState struct {
-	drv             driver.Driver
-	agent           client.OpAMPClient
+	drv driver.Driver
+	// agent is the narrow reporting surface (see statusReporter); the real
+	// OpAMP client satisfies it.
+	agent           statusReporter
 	lastAppliedHash []byte
+	// startup maps each OwnedFile to its content when the bridge started.
+	// A nil body means the file did not exist then. Set by Run; a nil map
+	// (tests only) makes withdrawal fail honestly instead of guessing.
+	startup map[string][]byte
+}
+
+func snapshotStartup(paths []string) map[string][]byte {
+	s := make(map[string][]byte, len(paths))
+	for _, p := range paths {
+		if b, err := os.ReadFile(p); err == nil {
+			if b == nil { // existing but empty file: not "absent"
+				b = []byte{}
+			}
+			s[p] = b
+		}
+	}
+	return s
 }
 
 func (s *bridgeState) onRemoteConfig(ctx context.Context, msg *types.MessageData) {
@@ -135,20 +168,36 @@ func (s *bridgeState) onRemoteConfig(ctx context.Context, msg *types.MessageData
 		return
 	}
 	hash := rc.ConfigHash
-	var body []byte
-	for _, cfg := range rc.Config.ConfigMap {
-		body = cfg.Body
-		break // single-artifact drivers for now; multi-object is a Phase-2 question
+	// Every object the server pushed, under the keys it pushed them. Go map
+	// iteration is random, so picking "the first entry" would hand a
+	// two-object push (e.g. falco.yaml + rules.yaml) a random half; the
+	// driver gets the whole map and splits by key.
+	cfg := driver.Config{}
+	for k, obj := range rc.Config.ConfigMap {
+		if obj != nil {
+			cfg[k] = obj.Body
+		}
 	}
-	if len(hash) == 0 || string(body) == string(s.lastAppliedHash) {
+	// An empty ConfigMap is a withdrawal (the OpAMP-spec way to say "run
+	// your local config"): restore what the agent found at startup and
+	// reload, so disk AND the running product go back to pre-agent state.
+	withdraw := len(rc.Config.ConfigMap) == 0
+	status, reason, skipped := s.applyRemoteConfig(ctx, hash, cfg, withdraw)
+	if skipped {
+		// The config is already applied and running (hash equals the last
+		// successful apply). Staying silent about it made the server mark
+		// the revision unconfirmed and keep a stale FAILED status — an
+		// operator cannot tell "already applied" from "agent died".
+		if len(hash) > 0 {
+			_ = s.agent.SetRemoteConfigStatus(&protobufs.RemoteConfigStatus{
+				LastRemoteConfigHash: hash,
+				Status:               protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED,
+			})
+			fmt.Printf("[opamp-agent] config %x -> APPLIED (already applied; no re-apply)\n", hash[:min(4, len(hash))])
+		}
 		return
 	}
 
-	status, reason := s.renderApplyVerify(ctx, body)
-
-	if status == protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED {
-		s.lastAppliedHash = append([]byte(nil), hash...)
-	}
 	_ = s.agent.SetRemoteConfigStatus(&protobufs.RemoteConfigStatus{
 		LastRemoteConfigHash: hash,
 		Status:               status,
@@ -158,30 +207,108 @@ func (s *bridgeState) onRemoteConfig(ctx context.Context, msg *types.MessageData
 	fmt.Printf("[opamp-agent] config %x -> %s %s\n", hash[:min(4, len(hash))], status, reason)
 }
 
-func (s *bridgeState) renderApplyVerify(ctx context.Context, body []byte) (protobufs.RemoteConfigStatuses, string) {
-	ident := s.drv.Identity()
-	prev := snapshotFiles(ident.OwnedFiles)
+// applyRemoteConfig runs the render → apply → verify pipeline (or, when
+// withdraw is set, the restore-startup-snapshot pipeline) and records the
+// applied hash. It is split out of onRemoteConfig so the pipeline is testable
+// without an OpAMP server or a live agent.
+//
+// skipped means "nothing to do": no hash, or the same config hash we already
+// applied. Comparing the hash (not the body) is what makes the server's
+// repeated RemoteConfig a no-op.
+func (s *bridgeState) applyRemoteConfig(ctx context.Context, hash []byte, cfg driver.Config, withdraw bool) (status protobufs.RemoteConfigStatuses, reason string, skipped bool) {
+	if len(hash) == 0 || string(hash) == string(s.lastAppliedHash) {
+		return 0, "", true
+	}
 
-	rendered, err := s.drv.Render(body)
+	if withdraw {
+		status, reason = s.withdrawApplyVerify(ctx)
+	} else {
+		status, reason = s.renderApplyVerify(ctx, cfg)
+	}
+	if status == protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED {
+		s.lastAppliedHash = append([]byte(nil), hash...)
+	}
+	return status, reason, false
+}
+
+func (s *bridgeState) renderApplyVerify(ctx context.Context, cfg driver.Config) (protobufs.RemoteConfigStatuses, string) {
+	prev := snapshotFiles(s.drv.Identity().OwnedFiles)
+
+	rendered, err := s.drv.Render(cfg)
 	if err != nil {
 		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "render: " + err.Error()
 	}
-	// The bridge owns artifact writes: driver.Render decides what goes where,
-	// the bridge puts it there (and can put the LKG copy back). Drivers only
-	// activate what the bridge has written. Write happens BEFORE Validate so
-	// validators that inspect the on-disk file (promtool, nginx -t, apachectl
-	// configtest) see the NEW content, not the previous one.
+	return s.writeValidateApplyVerify(ctx, rendered, prev, "")
+}
+
+// withdrawApplyVerify implements a withdrawal (an empty remote config: the
+// spec's "run your local config"). The bridge restores the STARTUP snapshot —
+// the files as the agent found them, before any push — and runs the same
+// write → validate → apply → verify pipeline, so the running product actually
+// reloads the restored files. Without this, a withdrawal leaves the pushed
+// config running forever and the revision reported FAILED (observed live
+// against a real falco: `render: empty config_map`, revision poisoned). If a
+// file did not exist at startup, restoring it means removing it.
+func (s *bridgeState) withdrawApplyVerify(ctx context.Context) (protobufs.RemoteConfigStatuses, string) {
+	if s.startup == nil {
+		// Run always sets this; a nil map means the state was built without a
+		// snapshot. Fail honestly rather than guess what "startup" was.
+		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED,
+			"withdrawal: no startup snapshot (bridge bug)"
+	}
+	ident := s.drv.Identity()
+	if len(ident.OwnedFiles) == 0 {
+		// Nothing the driver owns: the withdrawal is trivially satisfied.
+		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED, ""
+	}
+	prev := snapshotFiles(ident.OwnedFiles) // LKG = the running (pushed) config
+	var rendered driver.Rendered
+	for _, p := range ident.OwnedFiles {
+		body, existed := s.startup[p]
+		if !existed {
+			rendered.Artifacts = append(rendered.Artifacts, driver.Artifact{Path: p, Delete: true})
+			continue
+		}
+		rendered.Artifacts = append(rendered.Artifacts, driver.Artifact{Path: p, Body: body})
+	}
+	return s.writeValidateApplyVerify(ctx, rendered, prev, "withdrawal: ")
+}
+
+// writeValidateApplyVerify is the shared half of both pipelines: put the
+// rendered artifacts on disk (or remove them), validate, apply, verify, and
+// roll back to prev on any failure. Write happens BEFORE Validate so
+// validators that inspect the on-disk file (promtool, nginx -t, apachectl
+// configtest) see the NEW content, not the previous one.
+func (s *bridgeState) writeValidateApplyVerify(ctx context.Context, rendered driver.Rendered, prev map[string][]byte, label string) (protobufs.RemoteConfigStatuses, string) {
 	for _, a := range rendered.Artifacts {
+		if a.Delete {
+			if err := os.Remove(a.Path); err != nil && !os.IsNotExist(err) {
+				return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, label + "remove artifact: " + err.Error()
+			}
+			continue
+		}
+		// A fresh box may not have the artifact's directory yet (e.g.
+		// /etc/falco/opamp/rules.yaml on a host that never ran a rules push).
+		// Create it; the driver already declared the path as its own.
+		if dir := filepath.Dir(a.Path); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, label + "create artifact dir: " + err.Error()
+			}
+		}
 		if err := os.WriteFile(a.Path, a.Body, 0o644); err != nil {
-			return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "write artifact: " + err.Error()
+			return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, label + "write artifact: " + err.Error()
 		}
 	}
 	if err := s.drv.Validate(rendered); err != nil && err != driver.ErrUnsupported {
 		restoreFiles(prev) // validation failure: never apply, never disarm
-		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "validate: " + err.Error()
+		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, label + "validate: " + err.Error()
 	}
 	if err := s.drv.Apply(ctx, rendered); err != nil {
-		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "apply: " + err.Error()
+		// A transport-level apply error means the product probably never saw
+		// the new content; put the last-known-good files back so disk still
+		// reflects what is running (and so the next reconnect starts clean).
+		restoreFiles(prev)
+		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, label + "apply: " + err.Error()
 	}
 	applied, reason := s.drv.Verify(ctx, rendered)
 	if applied {
@@ -196,17 +323,17 @@ func (s *bridgeState) renderApplyVerify(ctx context.Context, body []byte) (proto
 	// restore and the reason says so.
 	if len(prev) == 0 {
 		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED,
-			reason + " (no LKG: driver owns no files)"
+			label + reason + " (no LKG: driver owns no files)"
 	}
 	restoreFiles(prev)
 	if err := s.drv.Apply(ctx, rendered); err == nil {
 		if ok, _ := s.drv.Verify(ctx, rendered); ok {
 			reason += " (rolled back to last-known-good)"
-			return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, reason
+			return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, label + reason
 		}
 	}
 	return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED,
-		reason + " (LKG ROLLBACK FAILED — manual intervention required)"
+		label + reason + " (LKG ROLLBACK FAILED — manual intervention required)"
 }
 
 // ---- small helpers ----
@@ -232,18 +359,35 @@ func toProtoHealth(h driver.Health) *protobufs.ComponentHealth {
 	if !h.StartTime.IsZero() {
 		ph.StartTimeUnixNano = uint64(h.StartTime.UnixNano())
 	}
-	_ = h.Detail
+	// The detail is the product's own reason ("not ready", a /healthz body);
+	// dropping it hides exactly what an operator needs. Trim to keep one
+	// health report from dominating a status message.
+	if d := strings.TrimSpace(h.Detail); d != "" {
+		if len(d) > 512 {
+			d = d[:512]
+		}
+		ph.Status = d
+	}
 	return ph
 }
 
+// loadOrCreateUID reads a 16-byte instance uid, or mints one from crypto/rand
+// and persists it. Identity must survive restarts (it is the server's key for
+// this host) and must not be guessable or collide across hosts sharing a clock,
+// so the bytes come from the OS CSPRNG.
 func loadOrCreateUID(path string) (types.InstanceUid, error) {
 	var uid types.InstanceUid
 	if b, err := os.ReadFile(path); err == nil && len(b) == len(uid) {
 		copy(uid[:], b)
 		return uid, nil
 	}
-	for i := range uid { // TODO: crypto/rand / uuid before this ships
-		uid[i] = byte(time.Now().UnixNano() >> (8 * (i % 8)))
+	if _, err := rand.Read(uid[:]); err != nil {
+		return uid, fmt.Errorf("generate uid: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return uid, fmt.Errorf("create uid directory: %w", err)
+		}
 	}
 	if err := os.WriteFile(path, uid[:], 0o600); err != nil {
 		return uid, err

@@ -30,7 +30,7 @@ type Manifest struct {
 		// http_endpoint method
 		Endpoint string `yaml:"endpoint"`
 		// signal method
-		Signal  string `yaml:"signal"`  // e.g. SIGHUP
+		Signal  string `yaml:"signal"` // e.g. SIGHUP
 		PidFile string `yaml:"pid_file"`
 	} `yaml:"apply"`
 	Validate struct {

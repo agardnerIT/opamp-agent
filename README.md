@@ -151,12 +151,26 @@ three files.
   reporting FAILED — a rejected push never leaves the product disarmed
 - Apply responses are never trusted as verification — `Verify` is the only
   source of truth
+- **Apply errors restore too**: a transport-level apply failure puts the
+  last-known-good files back, so disk still matches what is running
+- **Config-hash dedupe**: the server re-sends its last `RemoteConfig` on every
+  reconnect; the same hash is a no-op, a failed hash is retried
 - The bridge owns artifact file writes; drivers only activate
 - Pipeline ordering: artifacts are written **before** `Validate` runs, so
   validators that inspect the on-disk file (promtool, nginx -t) see the NEW
   content; a validate failure restores the snapshot and never applies
 - Drivers declare their product knowledge in one place; nothing else in the
   binary knows the product exists
+- Instance identity persists in `instance.uid`, minted from `crypto/rand` and
+  stable across restarts (parent directories are created as needed)
+
+## Tests
+
+The pipeline is covered end-to-end against a fake driver and real files on
+`t.TempDir()` — apply, verify-failure rollback, validate refusal, apply
+transport error, no-owned-files, hash dedupe, multi-artifact render, and the
+instance-uid rules. `go test -race ./...` is green locally and in CI
+(`.github/workflows/ci.yml`).
 
 ## Build & run
 
