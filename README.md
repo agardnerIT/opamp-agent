@@ -226,6 +226,11 @@ go vet ./...    # static checks
   reference vendor driver: Suricata managed by standard OpAMP in three
   files, including live rule reload with per-agent rejection feedback.
   Read its `driver.go` to see the entire product-specific surface.
+- **[opamp-falco](https://github.com/agardnerIT/opamp-falco)** — the second
+  reference: Falco managed by the same bridge, where "apply" means posting
+  to a reload-control socket and "verify" means polling Falco's own
+  generation counters. Conformance-verified against a live Falco 0.45.2.
+  Supersedes the standalone `falco-opamp`.
 - `examples/prometheus.yaml` — a complete Tier-1 integration with zero code.
 - The vendor note above is expanded in the opamp-server-py planning docs
   (adoption pitch: adopt the bridge vs. implement OpAMP natively).
