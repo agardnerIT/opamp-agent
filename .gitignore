@@ -1,0 +1,5 @@
+# binaries
+opamp-agent
+*.test
+# per-host agent identity, never commit
+instance.uid

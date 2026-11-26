@@ -1,0 +1,14 @@
+# The entire vendor artifact for managing Prometheus via opamp-agent.
+# Zero product-specific code anywhere in the bridge.
+driver: proc
+identity:
+  service_name: prometheus
+config:
+  path: /opt/homebrew/etc/prometheus.yml
+apply:
+  method: http_endpoint
+  endpoint: http://127.0.0.1:9090/-/reload
+validate:
+  command: ["/opt/homebrew/bin/promtool", "check", "config", "{config_path}"]
+report:
+  health_endpoint: http://127.0.0.1:9090/-/healthy
