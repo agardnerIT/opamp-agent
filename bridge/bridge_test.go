@@ -20,6 +20,9 @@ type fakeDriver struct {
 	ident     driver.Identity
 	artifacts []driver.Artifact
 
+	// lastConfig records what Render received, for the map-passthrough tests.
+	lastConfig driver.Config
+
 	renderErr   error
 	validateErr error
 	applyErr    error
@@ -41,7 +44,8 @@ type fakeDriver struct {
 
 func (f *fakeDriver) Identity() driver.Identity { return f.ident }
 
-func (f *fakeDriver) Render(cfg []byte) (driver.Rendered, error) {
+func (f *fakeDriver) Render(cfg driver.Config) (driver.Rendered, error) {
+	f.lastConfig = cfg
 	if f.renderErr != nil {
 		return driver.Rendered{}, f.renderErr
 	}
@@ -121,7 +125,7 @@ func TestPipelineAppliesAndWritesArtifacts(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, skipped := s.applyRemoteConfig(context.Background(), []byte("hash-1"), []byte("new: true\n"))
+	status, reason, skipped := s.applyRemoteConfig(context.Background(), []byte("hash-1"), driver.Config{"pushed.yaml": []byte("new: true\n")})
 	if skipped {
 		t.Fatal("first config must not be skipped")
 	}
@@ -163,7 +167,7 @@ func TestVerifyFailureRestoresLKGAndReapplies(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), []byte("bad\n"))
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")})
 	if status != failed {
 		t.Fatalf("want FAILED, got %v", status)
 	}
@@ -201,7 +205,7 @@ func TestValidateFailureNeverApplies(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), []byte("bad\n"))
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")})
 	if status != failed || !strings.Contains(reason, "validate:") || !strings.Contains(reason, "Undefined macro") {
 		t.Fatalf("want FAILED with validator text, got %v/%q", status, reason)
 	}
@@ -228,7 +232,7 @@ func TestApplyErrorRestoresLKG(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), []byte("bad\n"))
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")})
 	if status != failed || !strings.Contains(reason, "apply:") {
 		t.Fatalf("want FAILED with apply error, got %v/%q", status, reason)
 	}
@@ -252,7 +256,7 @@ func TestVerifyFailureWithNoOwnedFiles(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), []byte("x"))
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")})
 	if status != failed {
 		t.Fatalf("want FAILED, got %v", status)
 	}
@@ -275,10 +279,10 @@ func TestSameHashIsSkipped(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	if st, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), []byte("new\n")); skip || st != applied {
+	if st, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), driver.Config{"pushed.yaml": []byte("new\n")}); skip || st != applied {
 		t.Fatalf("first push: skip=%v status=%v", skip, st)
 	}
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), []byte("new\n")); !skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), driver.Config{"pushed.yaml": []byte("new\n")}); !skip {
 		t.Fatal("same config hash must be skipped")
 	}
 	if f.applyCalls != 1 {
@@ -296,10 +300,10 @@ func TestFailedHashIsRetried(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), []byte("x")); skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}); skip {
 		t.Fatal("the first attempt must run")
 	}
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), []byte("x")); skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}); skip {
 		t.Fatal("a failed hash must be retried, not skipped")
 	}
 }
@@ -324,7 +328,7 @@ func TestMultiArtifactRenderWritesAllFiles(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), []byte("x")); status != applied {
+	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}); status != applied {
 		t.Fatalf("want APPLIED, got %v/%q", status, reason)
 	}
 	if got := readFile(t, one); got != "a\n" {
@@ -344,7 +348,7 @@ func TestRenderErrorIsReported(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), []byte("x"))
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")})
 	if status != failed || !strings.Contains(reason, "render:") {
 		t.Fatalf("want FAILED with render error, got %v/%q", status, reason)
 	}
@@ -425,5 +429,132 @@ func TestLoadOrCreateUIDReplacesWrongSizeFile(t *testing.T) {
 	}
 	if info, err := os.Stat(path); err != nil || info.Size() != 16 {
 		t.Fatalf("want rewritten 16-byte file, got %v/%v", info, err)
+	}
+}
+
+// ---- multi-object config map (B1) ----
+
+// A two-object push reaches Render with BOTH keys intact — the failure mode
+// this replaces was "first map entry wins", which under Go's random map order
+// delivered a different half of the config on every push.
+func TestTwoObjectPushReachesRenderWithBothKeys(t *testing.T) {
+	f := &fakeDriver{
+		ident:       driver.Identity{ServiceName: "fake"},
+		artifacts:   []driver.Artifact{{Path: filepath.Join(t.TempDir(), "c.yaml"), Body: []byte("c")}},
+		validateErr: driver.ErrUnsupported,
+		verifyOK:    true,
+	}
+	s := newState(t, f)
+
+	cfg := driver.Config{
+		"falco.yaml": []byte("config: true\n"),
+		"rules.yaml": []byte("- rule: x\n"),
+	}
+	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); status != applied {
+		t.Fatalf("want APPLIED, got %v/%q", status, reason)
+	}
+	if len(f.lastConfig) != 2 {
+		t.Fatalf("Render got %d object(s), want 2", len(f.lastConfig))
+	}
+	if string(f.lastConfig["falco.yaml"]) != "config: true\n" || string(f.lastConfig["rules.yaml"]) != "- rule: x\n" {
+		t.Fatalf("objects arrived mangled: %v", f.lastConfig)
+	}
+}
+
+// A rules-only push passes the single key through; the bridge adds nothing
+// and drops nothing. The driver decides what an object means.
+func TestRulesOnlyPushPassesKeyThrough(t *testing.T) {
+	f := &fakeDriver{
+		ident:       driver.Identity{ServiceName: "fake"},
+		validateErr: driver.ErrUnsupported,
+		verifyOK:    true,
+	}
+	s := newState(t, f)
+
+	cfg := driver.Config{"rules.yaml": []byte("- rule: only\n")}
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); skip {
+		t.Fatal("push must reach the driver")
+	}
+	if len(f.lastConfig) != 1 || string(f.lastConfig["rules.yaml"]) != "- rule: only\n" {
+		t.Fatalf("rules-only push mangled: %v", f.lastConfig)
+	}
+}
+
+// Same for a config-only push under the other key.
+func TestConfigOnlyPushPassesKeyThrough(t *testing.T) {
+	f := &fakeDriver{
+		ident:       driver.Identity{ServiceName: "fake"},
+		validateErr: driver.ErrUnsupported,
+		verifyOK:    true,
+	}
+	s := newState(t, f)
+
+	cfg := driver.Config{"falco.yaml": []byte("config: only\n")}
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); skip {
+		t.Fatal("push must reach the driver")
+	}
+	if len(f.lastConfig) != 1 || string(f.lastConfig["falco.yaml"]) != "config: only\n" {
+		t.Fatalf("config-only push mangled: %v", f.lastConfig)
+	}
+}
+
+// A key the driver does not own is the driver's problem: the bridge delivers
+// every key as-is and the driver (here the fake, in reality e.g. the falco
+// driver) rejects unknown ones. The bridge must not silently filter.
+func TestUnknownKeyIsPassedThroughToDriver(t *testing.T) {
+	f := &fakeDriver{
+		ident:       driver.Identity{ServiceName: "fake"},
+		validateErr: driver.ErrUnsupported,
+		verifyOK:    true,
+	}
+	s := newState(t, f)
+
+	cfg := driver.Config{"mystery.bin": []byte("\x00\x01")}
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); skip {
+		t.Fatal("push must reach the driver")
+	}
+	if _, ok := f.lastConfig["mystery.bin"]; !ok {
+		t.Fatalf("unknown key filtered by the bridge: %v", f.lastConfig)
+	}
+}
+
+// ---- artifact parent directories (B2) ----
+
+// The rules path on a fresh box lives in a directory that does not exist yet
+// (/etc/falco/opamp/rules.yaml). The write must create it, not fail.
+func TestArtifactWriteCreatesParentDirectories(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "etc", "falco", "opamp", "rules.yaml")
+
+	f := &fakeDriver{
+		ident:       driver.Identity{ServiceName: "fake", OwnedFiles: []string{nested}},
+		artifacts:   []driver.Artifact{{Path: nested, Body: []byte("- rule: x\n")}},
+		validateErr: driver.ErrUnsupported,
+		verifyOK:    true,
+	}
+	s := newState(t, f)
+
+	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"rules.yaml": []byte("- rule: x\n")}); status != applied {
+		t.Fatalf("want APPLIED, got %v/%q", status, reason)
+	}
+	if got := readFile(t, nested); got != "- rule: x\n" {
+		t.Fatalf("artifact not written through created dirs, = %q", got)
+	}
+}
+
+// ---- health detail (B3) ----
+
+// The product's own health reason reaches the report instead of being
+// dropped, and is trimmed to a sane length.
+func TestToProtoHealthCarriesDetail(t *testing.T) {
+	ph := toProtoHealth(driver.Health{Healthy: false, Detail: "not ready: /healthz says 503"})
+	if ph.Status != "not ready: /healthz says 503" {
+		t.Fatalf("detail dropped or mangled: %q", ph.Status)
+	}
+
+	long := strings.Repeat("x", 1000)
+	ph = toProtoHealth(driver.Health{Healthy: true, Detail: long})
+	if len(ph.Status) != 512 {
+		t.Fatalf("detail not trimmed: %d bytes", len(ph.Status))
 	}
 }

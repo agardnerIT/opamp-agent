@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/agardnerIT/opamp-agent/driver"
@@ -136,12 +137,17 @@ func (s *bridgeState) onRemoteConfig(ctx context.Context, msg *types.MessageData
 		return
 	}
 	hash := rc.ConfigHash
-	var body []byte
-	for _, cfg := range rc.Config.ConfigMap {
-		body = cfg.Body
-		break // single-artifact drivers for now; multi-object is a Phase-2 question
+	// Every object the server pushed, under the keys it pushed them. Go map
+	// iteration is random, so picking "the first entry" would hand a
+	// two-object push (e.g. falco.yaml + rules.yaml) a random half; the
+	// driver gets the whole map and splits by key.
+	cfg := driver.Config{}
+	for k, obj := range rc.Config.ConfigMap {
+		if obj != nil {
+			cfg[k] = obj.Body
+		}
 	}
-	status, reason, skipped := s.applyRemoteConfig(ctx, hash, body)
+	status, reason, skipped := s.applyRemoteConfig(ctx, hash, cfg)
 	if skipped {
 		return
 	}
@@ -162,23 +168,23 @@ func (s *bridgeState) onRemoteConfig(ctx context.Context, msg *types.MessageData
 // skipped means "nothing to do": no hash, or the same config hash we already
 // applied. Comparing the hash (not the body) is what makes the server's
 // repeated RemoteConfig a no-op.
-func (s *bridgeState) applyRemoteConfig(ctx context.Context, hash, body []byte) (status protobufs.RemoteConfigStatuses, reason string, skipped bool) {
+func (s *bridgeState) applyRemoteConfig(ctx context.Context, hash []byte, cfg driver.Config) (status protobufs.RemoteConfigStatuses, reason string, skipped bool) {
 	if len(hash) == 0 || string(hash) == string(s.lastAppliedHash) {
 		return 0, "", true
 	}
 
-	status, reason = s.renderApplyVerify(ctx, body)
+	status, reason = s.renderApplyVerify(ctx, cfg)
 	if status == protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED {
 		s.lastAppliedHash = append([]byte(nil), hash...)
 	}
 	return status, reason, false
 }
 
-func (s *bridgeState) renderApplyVerify(ctx context.Context, body []byte) (protobufs.RemoteConfigStatuses, string) {
+func (s *bridgeState) renderApplyVerify(ctx context.Context, cfg driver.Config) (protobufs.RemoteConfigStatuses, string) {
 	ident := s.drv.Identity()
 	prev := snapshotFiles(ident.OwnedFiles)
 
-	rendered, err := s.drv.Render(body)
+	rendered, err := s.drv.Render(cfg)
 	if err != nil {
 		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "render: " + err.Error()
 	}
@@ -188,6 +194,14 @@ func (s *bridgeState) renderApplyVerify(ctx context.Context, body []byte) (proto
 	// validators that inspect the on-disk file (promtool, nginx -t, apachectl
 	// configtest) see the NEW content, not the previous one.
 	for _, a := range rendered.Artifacts {
+		// A fresh box may not have the artifact's directory yet (e.g.
+		// /etc/falco/opamp/rules.yaml on a host that never ran a rules push).
+		// Create it; the driver already declared the path as its own.
+		if dir := filepath.Dir(a.Path); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "create artifact dir: " + err.Error()
+			}
+		}
 		if err := os.WriteFile(a.Path, a.Body, 0o644); err != nil {
 			return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "write artifact: " + err.Error()
 		}
@@ -252,7 +266,15 @@ func toProtoHealth(h driver.Health) *protobufs.ComponentHealth {
 	if !h.StartTime.IsZero() {
 		ph.StartTimeUnixNano = uint64(h.StartTime.UnixNano())
 	}
-	_ = h.Detail
+	// The detail is the product's own reason ("not ready", a /healthz body);
+	// dropping it hides exactly what an operator needs. Trim to keep one
+	// health report from dominating a status message.
+	if d := strings.TrimSpace(h.Detail); d != "" {
+		if len(d) > 512 {
+			d = d[:512]
+		}
+		ph.Status = d
+	}
 	return ph
 }
 

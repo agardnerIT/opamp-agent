@@ -35,6 +35,13 @@ type Artifact struct {
 	Body []byte
 }
 
+// Config is the whole remote config: one entry per OpAMP ConfigMap object,
+// keyed exactly as the server pushed it (e.g. "falco.yaml", "rules.yaml").
+// The bridge does not pick a "primary" object — multi-object products are the
+// reason this is a map, and which keys matter is the driver's contract with
+// its server profile, not the bridge's business.
+type Config map[string][]byte
+
 // Rendered is the full set of artifacts produced by one Render call.
 type Rendered struct {
 	Artifacts []Artifact
@@ -54,8 +61,12 @@ type Driver interface {
 	// Identity: "who are you, and which files do you own?"
 	Identity() Identity
 
-	// Render: "given the remote config, what goes on disk?"
-	Render(cfg []byte) (Rendered, error)
+	// Render: "given the remote config, what goes on disk?" The map carries
+	// every ConfigMap object the server pushed, under the keys it pushed them.
+	// A driver that owns one file takes the single entry; a driver whose
+	// profile defines named objects (falco.yaml + rules.yaml) splits by key
+	// and rejects keys it does not own.
+	Render(cfg Config) (Rendered, error)
 
 	// Validate: "will the product accept this before we apply it?"
 	// Return ErrUnsupported when the product has no such check — apply-time

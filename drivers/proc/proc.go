@@ -36,13 +36,23 @@ func (d *Driver) Identity() driver.Identity {
 	}
 }
 
-// render: the remote config body replaces the config file.
-func (d *Driver) Render(cfg []byte) (driver.Rendered, error) {
-	if len(cfg) == 0 {
+// render: the remote config replaces the config file. The proc driver is a
+// single-file driver: it takes the single entry explicitly (by key when the
+// server names one, otherwise the sole entry) and refuses a multi-object push
+// it has no way to place.
+func (d *Driver) Render(cfg driver.Config) (driver.Rendered, error) {
+	if len(cfg) != 1 {
+		return driver.Rendered{}, fmt.Errorf("proc driver manages one config file; got %d config objects", len(cfg))
+	}
+	var body []byte
+	for _, b := range cfg {
+		body = b
+	}
+	if len(body) == 0 {
 		return driver.Rendered{}, fmt.Errorf("empty config body")
 	}
 	return driver.Rendered{Artifacts: []driver.Artifact{
-		{Path: d.m.Config.Path, Body: cfg},
+		{Path: d.m.Config.Path, Body: body},
 	}}, nil
 }
 
