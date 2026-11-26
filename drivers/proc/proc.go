@@ -17,8 +17,8 @@ import (
 
 // Driver implements driver.Driver for any manifest-described product.
 type Driver struct {
-	m       Manifest
-	last    *applyResult // the apply response, remembered for Verify
+	m    Manifest
+	last *applyResult // the apply response, remembered for Verify
 }
 
 type applyResult struct {

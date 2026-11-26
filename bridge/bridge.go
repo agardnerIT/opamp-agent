@@ -9,11 +9,12 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/agardnerIT/opamp-agent/driver"
 	"github.com/open-telemetry/opamp-go/client"
@@ -23,8 +24,8 @@ import (
 
 // Options configure one bridge run.
 type Options struct {
-	ServerURL string        // OpAMP endpoint, ws(s):// or http(s)://
-	Token     string        // agent bearer token
+	ServerURL string // OpAMP endpoint, ws(s):// or http(s)://
+	Token     string // agent bearer token
 	// InstanceUIDFile persists this host's agent identity across restarts;
 	// created if missing. Default "instance.uid" in the working directory.
 	InstanceUIDFile string
@@ -140,15 +141,11 @@ func (s *bridgeState) onRemoteConfig(ctx context.Context, msg *types.MessageData
 		body = cfg.Body
 		break // single-artifact drivers for now; multi-object is a Phase-2 question
 	}
-	if len(hash) == 0 || string(body) == string(s.lastAppliedHash) {
+	status, reason, skipped := s.applyRemoteConfig(ctx, hash, body)
+	if skipped {
 		return
 	}
 
-	status, reason := s.renderApplyVerify(ctx, body)
-
-	if status == protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED {
-		s.lastAppliedHash = append([]byte(nil), hash...)
-	}
 	_ = s.agent.SetRemoteConfigStatus(&protobufs.RemoteConfigStatus{
 		LastRemoteConfigHash: hash,
 		Status:               status,
@@ -156,6 +153,25 @@ func (s *bridgeState) onRemoteConfig(ctx context.Context, msg *types.MessageData
 	})
 	_ = s.agent.UpdateEffectiveConfig(ctx)
 	fmt.Printf("[opamp-agent] config %x -> %s %s\n", hash[:min(4, len(hash))], status, reason)
+}
+
+// applyRemoteConfig runs the render → apply → verify pipeline and records the
+// applied hash. It is split out of onRemoteConfig so the pipeline is testable
+// without an OpAMP server or a live agent.
+//
+// skipped means "nothing to do": no hash, or the same config hash we already
+// applied. Comparing the hash (not the body) is what makes the server's
+// repeated RemoteConfig a no-op.
+func (s *bridgeState) applyRemoteConfig(ctx context.Context, hash, body []byte) (status protobufs.RemoteConfigStatuses, reason string, skipped bool) {
+	if len(hash) == 0 || string(hash) == string(s.lastAppliedHash) {
+		return 0, "", true
+	}
+
+	status, reason = s.renderApplyVerify(ctx, body)
+	if status == protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED {
+		s.lastAppliedHash = append([]byte(nil), hash...)
+	}
+	return status, reason, false
 }
 
 func (s *bridgeState) renderApplyVerify(ctx context.Context, body []byte) (protobufs.RemoteConfigStatuses, string) {
@@ -181,6 +197,10 @@ func (s *bridgeState) renderApplyVerify(ctx context.Context, body []byte) (proto
 		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "validate: " + err.Error()
 	}
 	if err := s.drv.Apply(ctx, rendered); err != nil {
+		// A transport-level apply error means the product probably never saw
+		// the new content; put the last-known-good files back so disk still
+		// reflects what is running (and so the next reconnect starts clean).
+		restoreFiles(prev)
 		return protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, "apply: " + err.Error()
 	}
 	applied, reason := s.drv.Verify(ctx, rendered)
@@ -236,14 +256,23 @@ func toProtoHealth(h driver.Health) *protobufs.ComponentHealth {
 	return ph
 }
 
+// loadOrCreateUID reads a 16-byte instance uid, or mints one from crypto/rand
+// and persists it. Identity must survive restarts (it is the server's key for
+// this host) and must not be guessable or collide across hosts sharing a clock,
+// so the bytes come from the OS CSPRNG.
 func loadOrCreateUID(path string) (types.InstanceUid, error) {
 	var uid types.InstanceUid
 	if b, err := os.ReadFile(path); err == nil && len(b) == len(uid) {
 		copy(uid[:], b)
 		return uid, nil
 	}
-	for i := range uid { // TODO: crypto/rand / uuid before this ships
-		uid[i] = byte(time.Now().UnixNano() >> (8 * (i % 8)))
+	if _, err := rand.Read(uid[:]); err != nil {
+		return uid, fmt.Errorf("generate uid: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return uid, fmt.Errorf("create uid directory: %w", err)
+		}
 	}
 	if err := os.WriteFile(path, uid[:], 0o600); err != nil {
 		return uid, err
