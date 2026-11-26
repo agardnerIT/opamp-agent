@@ -1,5 +1,7 @@
 # opamp-agent — the generic OpAMP bridge
 
+![Warning: Entirely vibecoded](https://img.shields.io/badge/Warning-Entirely%20vibecoded-orange?style=for-the-badge)
+
 > **Status: working, proven end-to-end against a live OpAMP server.** One
 > binary that speaks standard OpAMP on behalf of a product that doesn't.
 
