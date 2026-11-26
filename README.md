@@ -31,6 +31,14 @@ work — OpAMP transport, enrollment, identity, heartbeats, health reporting,
 config persistence, rollback — lives here, written once, audited once:
 
 ```
+OpAMP Server ── OpAMP Agent (this repo) ── Your product
+```
+
+The agent speaks standard OpAMP to the server on the left. On the right, it
+talks to your product through one of two contracts — pick the one that fits
+(see [Making your product speak OpAMP](#making-your-product-speak-opamp)).
+
+```
 driver/driver.go     Interface 2 — the six-verb contract (the vendor-facing surface)
 bridge/bridge.go     The commodity layer: opamp-go transport + the LKG
                      render→apply→verify pipeline
@@ -39,7 +47,6 @@ drivers/             Compiled-in drivers
                      (no product-specific code — a manifest is the whole
                      vendor artifact; see examples/prometheus.yaml)
 cmd/opamp-agent/     Binary; drivers are compiled in and selected by flag
-captures-prometheus.md  Evidence trail for the proc driver's end-to-end proof
 ```
 
 ## The six questions a driver answers
@@ -52,6 +59,89 @@ captures-prometheus.md  Evidence trail for the proc driver's end-to-end proof
 | `Apply` | how does it take effect? (signal / reload API / control socket) |
 | `Verify` | did it ACTUALLY take effect? (apply responses can lie) |
 | `Health` / `EffectiveConfig` | alive? what's running? |
+
+## Making your product speak OpAMP
+
+This is the part you actually have to write, and it is one of two things:
+
+- **A YAML manifest, zero code** — if your product takes its config from a
+  file, can reload it (HTTP endpoint or signal), and exposes a health
+  endpoint. The built-in `proc` driver does the rest.
+- **A Go driver, ~6 methods** — if your product's management surface is
+  anything else (control socket, admin API, bespoke behavior). You implement
+  `driver.Driver`; the bridge does everything else.
+
+And the standing exception, restated: if you *can* embed an OpAMP client
+library in your agent, do that instead (see the vendor note at the top).
+This section is for when you can't or won't.
+
+### Path 1: a manifest, no code
+
+`examples/prometheus.yaml` is a complete integration:
+
+```yaml
+driver: proc
+identity:
+  service_name: prometheus
+config:
+  path: /opt/homebrew/etc/prometheus.yml
+apply:
+  method: http_endpoint
+  endpoint: http://127.0.0.1:9090/-/reload
+validate:
+  command: ["/opt/homebrew/bin/promtool", "check", "config", "{config_path}"]
+report:
+  health_endpoint: http://127.0.0.1:9090/-/healthy
+```
+
+Field reference:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `driver` | yes | must be `proc` |
+| `identity.service_name` | yes | reported in AgentDescription |
+| `config.path` | yes | the config file the agent owns, renders, and snapshots for LKG recovery |
+| `apply.method` | yes | `http_endpoint` or `signal` |
+| `apply.endpoint` | if http_endpoint | the reload URL (e.g. `/-/reload`) |
+| `apply.signal` + `apply.pid_file` | if signal | `SIGHUP`, `SIGUSR1`, or `SIGUSR2`, plus the path to the pid file |
+| `validate.command` | no | fixed argv to run pre-apply; `{config_path}` is replaced with `config.path`. Omit it and the bridge degrades honestly: apply-time `Verify` becomes the only guard |
+| `report.health_endpoint` | yes | URL polled for health reporting |
+
+Three properties worth knowing before you trust it: the manifest is a strict
+allowlist (an unknown field is a load error, so typos don't silently disable
+a check), commands are fixed argv from the manifest — never from the server
+— and manifests are selected locally with `-manifest`, never pushed by the
+server.
+
+### Path 2: a Go driver
+
+If file-plus-reload doesn't describe your product, implement the interface in
+`driver/driver.go`. It is six verbs, none of which know OpAMP exists:
+
+```go
+func (d *MyDriver) Identity() Identity              // name, version, OwnedFiles
+func (d *MyDriver) Render(cfg []byte) (Rendered, error)  // config → files on disk
+func (d *MyDriver) Validate(r Rendered) error        // pre-apply check; ErrUnsupported is honest
+func (d *MyDriver) Apply(ctx, r) error               // signal / reload API / socket
+func (d *MyDriver) Verify(ctx, r) (applied bool, reason string)  // did it ACTUALLY take effect?
+func (d *MyDriver) Health(ctx) Health
+func (d *MyDriver) EffectiveConfig(ctx) map[string][]byte
+```
+
+Put it in `drivers/<yourproduct>/`, add one line to the switch in
+`cmd/opamp-agent/main.go`, rebuild, and run with `-driver <yourproduct>`.
+
+You write only product knowledge. The bridge gives you, once, for all
+drivers: the OpAMP transport and enrollment, LKG snapshot-and-rollback of
+`OwnedFiles` on failed verification, artifact writes (files land on disk
+**before** `Validate` runs, so validators like `promtool` or `nginx -t` see
+the new content), and the rule that apply responses are never trusted —
+your `Verify` is the only source of truth.
+
+For a worked example of a full driver, see
+[opamp-suricata](https://github.com/agardnerIT/opamp-suricata)'s
+`driver.go` — the entire product-specific surface of that integration is
+three files.
 
 ## What the bridge guarantees (so drivers never re-invent it)
 
@@ -97,10 +187,10 @@ Run it against your OpAMP server with the `proc` driver and a manifest:
 | `-driver` | which compiled-in driver to use (`proc`) |
 | `-manifest` | path to the driver manifest (e.g. `examples/prometheus.yaml`) |
 
-The agent persists its identity in an `instance.uid` file (default: the
-working directory, override with `-instance-uid-file`) so it keeps the same
-agent identity across restarts. Kill it with `SIGINT`/`SIGTERM` for a clean
-shutdown.
+The agent persists its identity in an `instance.uid` file in the working
+directory, so it keeps the same agent identity across restarts. Run it with
+`--list-drivers` to see what's compiled in. Kill it with `SIGINT`/`SIGTERM`
+for a clean shutdown.
 
 Other useful commands:
 
