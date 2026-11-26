@@ -74,9 +74,10 @@ captures-prometheus.md  Evidence trail for the proc driver's end-to-end proof
 
 ## Related
 
-- The reference vendor driver (Suricata) ships as its own module — see the
-  adoption pitch in the opamp-server-py planning docs for the two-exit story
-  (adopt the bridge vs. implement OpAMP natively).
+- **[opamp-suricata](https://github.com/agardnerIT/opamp-suricata)** — the
+  reference vendor driver: Suricata managed by standard OpAMP in three
+  files, including live rule reload with per-agent rejection feedback.
+  Read its `driver.go` to see the entire product-specific surface.
 - `examples/prometheus.yaml` — a complete Tier-1 integration with zero code.
-- `../01-architecture.md` — seam list this code implements (planning docs,
-  not published here yet).
+- The vendor note above is expanded in the opamp-server-py planning docs
+  (adoption pitch: adopt the bridge vs. implement OpAMP natively).
