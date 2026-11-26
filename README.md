@@ -68,6 +68,48 @@ captures-prometheus.md  Evidence trail for the proc driver's end-to-end proof
 - Drivers declare their product knowledge in one place; nothing else in the
   binary knows the product exists
 
+## Build & run
+
+Requires Go 1.25+ (see `go.mod`).
+
+```sh
+# build the binary (all drivers are compiled in)
+go build -o opamp-agent ./cmd/opamp-agent
+
+# or install straight to $GOPATH/bin
+go install github.com/agardnerIT/opamp-agent/cmd/opamp-agent@latest
+```
+
+Run it against your OpAMP server with the `proc` driver and a manifest:
+
+```sh
+./opamp-agent \
+  -server wss://your-opamp-server.example/v1/opamps \
+  -token "$OPAMP_TOKEN" \
+  -driver proc \
+  -manifest examples/prometheus.yaml
+```
+
+| Flag | Meaning |
+|---|---|
+| `-server` | OpAMP endpoint, `ws(s)://` or `http(s)://` |
+| `-token` | agent bearer token (or set `OPAMP_TOKEN`) |
+| `-driver` | which compiled-in driver to use (`proc`) |
+| `-manifest` | path to the driver manifest (e.g. `examples/prometheus.yaml`) |
+
+The agent persists its identity in an `instance.uid` file (default: the
+working directory, override with `-instance-uid-file`) so it keeps the same
+agent identity across restarts. Kill it with `SIGINT`/`SIGTERM` for a clean
+shutdown.
+
+Other useful commands:
+
+```sh
+go test ./...   # run the test suite
+
+go vet ./...    # static checks
+```
+
 ## Rules for this repo
 
 1. No product names outside a driver package (grep gate).
