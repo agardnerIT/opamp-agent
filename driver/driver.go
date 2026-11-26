@@ -33,6 +33,11 @@ type Identity struct {
 type Artifact struct {
 	Path string
 	Body []byte
+	// Delete removes the file instead of writing it. The bridge uses this
+	// when it restores the startup snapshot on withdrawal and a file did
+	// not exist then: the honest restore of "wasn't there" is "gone", not
+	// an empty file. Drivers that only render pushes never set it.
+	Delete bool
 }
 
 // Config is the whole remote config: one entry per OpAMP ConfigMap object,

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/agardnerIT/opamp-agent/driver"
+	"github.com/open-telemetry/opamp-go/client/types"
 	"github.com/open-telemetry/opamp-go/protobufs"
 )
 
@@ -125,7 +126,7 @@ func TestPipelineAppliesAndWritesArtifacts(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, skipped := s.applyRemoteConfig(context.Background(), []byte("hash-1"), driver.Config{"pushed.yaml": []byte("new: true\n")})
+	status, reason, skipped := s.applyRemoteConfig(context.Background(), []byte("hash-1"), driver.Config{"pushed.yaml": []byte("new: true\n")}, false)
 	if skipped {
 		t.Fatal("first config must not be skipped")
 	}
@@ -167,7 +168,7 @@ func TestVerifyFailureRestoresLKGAndReapplies(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")})
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")}, false)
 	if status != failed {
 		t.Fatalf("want FAILED, got %v", status)
 	}
@@ -205,7 +206,7 @@ func TestValidateFailureNeverApplies(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")})
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")}, false)
 	if status != failed || !strings.Contains(reason, "validate:") || !strings.Contains(reason, "Undefined macro") {
 		t.Fatalf("want FAILED with validator text, got %v/%q", status, reason)
 	}
@@ -232,7 +233,7 @@ func TestApplyErrorRestoresLKG(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")})
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("hash-bad"), driver.Config{"pushed.yaml": []byte("bad\n")}, false)
 	if status != failed || !strings.Contains(reason, "apply:") {
 		t.Fatalf("want FAILED with apply error, got %v/%q", status, reason)
 	}
@@ -256,7 +257,7 @@ func TestVerifyFailureWithNoOwnedFiles(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")})
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}, false)
 	if status != failed {
 		t.Fatalf("want FAILED, got %v", status)
 	}
@@ -279,10 +280,10 @@ func TestSameHashIsSkipped(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	if st, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), driver.Config{"pushed.yaml": []byte("new\n")}); skip || st != applied {
+	if st, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), driver.Config{"pushed.yaml": []byte("new\n")}, false); skip || st != applied {
 		t.Fatalf("first push: skip=%v status=%v", skip, st)
 	}
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), driver.Config{"pushed.yaml": []byte("new\n")}); !skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("same-hash"), driver.Config{"pushed.yaml": []byte("new\n")}, false); !skip {
 		t.Fatal("same config hash must be skipped")
 	}
 	if f.applyCalls != 1 {
@@ -300,10 +301,10 @@ func TestFailedHashIsRetried(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}); skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}, false); skip {
 		t.Fatal("the first attempt must run")
 	}
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}); skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}, false); skip {
 		t.Fatal("a failed hash must be retried, not skipped")
 	}
 }
@@ -328,7 +329,7 @@ func TestMultiArtifactRenderWritesAllFiles(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}); status != applied {
+	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}, false); status != applied {
 		t.Fatalf("want APPLIED, got %v/%q", status, reason)
 	}
 	if got := readFile(t, one); got != "a\n" {
@@ -348,7 +349,7 @@ func TestRenderErrorIsReported(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")})
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"pushed.yaml": []byte("x")}, false)
 	if status != failed || !strings.Contains(reason, "render:") {
 		t.Fatalf("want FAILED with render error, got %v/%q", status, reason)
 	}
@@ -450,7 +451,7 @@ func TestTwoObjectPushReachesRenderWithBothKeys(t *testing.T) {
 		"falco.yaml": []byte("config: true\n"),
 		"rules.yaml": []byte("- rule: x\n"),
 	}
-	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); status != applied {
+	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), cfg, false); status != applied {
 		t.Fatalf("want APPLIED, got %v/%q", status, reason)
 	}
 	if len(f.lastConfig) != 2 {
@@ -472,7 +473,7 @@ func TestRulesOnlyPushPassesKeyThrough(t *testing.T) {
 	s := newState(t, f)
 
 	cfg := driver.Config{"rules.yaml": []byte("- rule: only\n")}
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg, false); skip {
 		t.Fatal("push must reach the driver")
 	}
 	if len(f.lastConfig) != 1 || string(f.lastConfig["rules.yaml"]) != "- rule: only\n" {
@@ -490,7 +491,7 @@ func TestConfigOnlyPushPassesKeyThrough(t *testing.T) {
 	s := newState(t, f)
 
 	cfg := driver.Config{"falco.yaml": []byte("config: only\n")}
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg, false); skip {
 		t.Fatal("push must reach the driver")
 	}
 	if len(f.lastConfig) != 1 || string(f.lastConfig["falco.yaml"]) != "config: only\n" {
@@ -510,7 +511,7 @@ func TestUnknownKeyIsPassedThroughToDriver(t *testing.T) {
 	s := newState(t, f)
 
 	cfg := driver.Config{"mystery.bin": []byte("\x00\x01")}
-	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg); skip {
+	if _, _, skip := s.applyRemoteConfig(context.Background(), []byte("h"), cfg, false); skip {
 		t.Fatal("push must reach the driver")
 	}
 	if _, ok := f.lastConfig["mystery.bin"]; !ok {
@@ -534,7 +535,7 @@ func TestArtifactWriteCreatesParentDirectories(t *testing.T) {
 	}
 	s := newState(t, f)
 
-	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"rules.yaml": []byte("- rule: x\n")}); status != applied {
+	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{"rules.yaml": []byte("- rule: x\n")}, false); status != applied {
 		t.Fatalf("want APPLIED, got %v/%q", status, reason)
 	}
 	if got := readFile(t, nested); got != "- rule: x\n" {
@@ -556,5 +557,170 @@ func TestToProtoHealthCarriesDetail(t *testing.T) {
 	ph = toProtoHealth(driver.Health{Healthy: true, Detail: long})
 	if len(ph.Status) != 512 {
 		t.Fatalf("detail not trimmed: %d bytes", len(ph.Status))
+	}
+}
+
+// ---- withdrawal (empty config_map = the spec's "run your local config") ----
+
+// recordingReporter captures what the bridge tells the server about remote
+// config, so onRemoteConfig's status reporting is testable end to end.
+type recordingReporter struct {
+	statuses []*protobufs.RemoteConfigStatus
+}
+
+func (r *recordingReporter) SetRemoteConfigStatus(st *protobufs.RemoteConfigStatus) error {
+	r.statuses = append(r.statuses, st)
+	return nil
+}
+func (r *recordingReporter) UpdateEffectiveConfig(context.Context) error { return nil }
+
+func TestWithdrawalRestoresStartupSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "owned.yaml")
+	writeFile(t, file, "startup: true\n")
+
+	f := &fakeDriver{ident: driver.Identity{OwnedFiles: []string{file}}, verifyOK: true,
+		artifacts: []driver.Artifact{{Path: file, Body: []byte("pushed: true\n")}}}
+	s := newState(t, f)
+	s.startup = map[string][]byte{file: []byte("startup: true\n")}
+
+	if status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("push"), driver.Config{"pushed.yaml": []byte("pushed: true\n")}, false); status != applied {
+		t.Fatalf("push setup failed: %s %s", status, reason)
+	}
+	if got := readFile(t, file); got != "pushed: true\n" {
+		t.Fatalf("push setup: file not written: %q", got)
+	}
+
+	// The withdrawal itself: an empty config_map under a new hash.
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("withdraw"), driver.Config{}, true)
+	if status != applied {
+		t.Fatalf("withdrawal must apply: %s %s", status, reason)
+	}
+	if got := readFile(t, file); got != "startup: true\n" {
+		t.Fatalf("withdrawal did not restore the startup snapshot: %q", got)
+	}
+	if f.applyCalls < 2 {
+		t.Fatalf("withdrawal must reload the product after restoring (apply calls: %d)", f.applyCalls)
+	}
+	if s.lastAppliedHash == nil || string(s.lastAppliedHash) != "withdraw" {
+		t.Fatalf("withdrawal hash not recorded as applied: %q", s.lastAppliedHash)
+	}
+}
+
+func TestWithdrawalRemovesFileAbsentAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "created-by-push.yaml")
+
+	f := &fakeDriver{ident: driver.Identity{OwnedFiles: []string{file}}, verifyOK: true,
+		artifacts: []driver.Artifact{{Path: file, Body: []byte("x")}}}
+	s := newState(t, f)
+	s.startup = map[string][]byte{} // the owned file did not exist when the agent started
+
+	if st, rs, _ := s.applyRemoteConfig(context.Background(), []byte("push"), driver.Config{"p": []byte("x")}, false); st != applied {
+		t.Fatalf("push setup failed: %s %s", st, rs)
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("push setup: file missing: %v", err)
+	}
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("withdraw"), driver.Config{}, true)
+	if status != applied {
+		t.Fatalf("withdrawal must apply: %s %s", status, reason)
+	}
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Fatalf("a file the box did not have at startup must be removed by withdrawal, not emptied (err=%v)", err)
+	}
+}
+
+func TestWithdrawalFailureRestoresRunningConfig(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "owned.yaml")
+	writeFile(t, file, "startup: true\n")
+
+	f := &fakeDriver{ident: driver.Identity{OwnedFiles: []string{file}}, verifySeq: []bool{true, false, true},
+		artifacts: []driver.Artifact{{Path: file, Body: []byte("pushed: true\n")}}}
+	s := newState(t, f)
+	s.startup = map[string][]byte{file: []byte("startup: true\n")}
+
+	if st, rs, _ := s.applyRemoteConfig(context.Background(), []byte("push"), driver.Config{"p": []byte("pushed: true\n")}, false); st != applied {
+		t.Fatalf("push setup failed: %s %s", st, rs)
+	}
+
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("withdraw"), driver.Config{}, true)
+	if status != failed {
+		t.Fatalf("a rejected withdrawal must be FAILED: %s", status)
+	}
+	if !strings.Contains(reason, "rolled back to last-known-good") {
+		t.Fatalf("reason must say the running config was restored: %q", reason)
+	}
+	if got := readFile(t, file); got != "pushed: true\n" {
+		t.Fatalf("failed withdrawal must restore the config that is running: %q", got)
+	}
+}
+
+func TestWithdrawalWithoutStartupSnapshotFailsHonestly(t *testing.T) {
+	f := &fakeDriver{ident: driver.Identity{OwnedFiles: []string{"/tmp/whatever.yaml"}}}
+	s := newState(t, f) // no startup snapshot (Run always sets one)
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{}, true)
+	if status != failed || !strings.Contains(reason, "no startup snapshot") {
+		t.Fatalf("withdrawal without a snapshot must fail honestly, got %s %q", status, reason)
+	}
+}
+
+func TestWithdrawalWithNoOwnedFilesAppliesTrivially(t *testing.T) {
+	f := &fakeDriver{ident: driver.Identity{}} // driver owns nothing
+	s := newState(t, f)
+	s.startup = snapshotStartup(nil)
+	status, reason, _ := s.applyRemoteConfig(context.Background(), []byte("h"), driver.Config{}, true)
+	if status != applied || reason != "" {
+		t.Fatalf("withdrawal with nothing owned is a no-op success: %s %q", status, reason)
+	}
+}
+
+// ---- the same-hash skip must report status (finding 2) ----
+
+func TestSameHashSkipReportsAppliedStatus(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "owned.yaml")
+	writeFile(t, file, "v1\n")
+	f := &fakeDriver{ident: driver.Identity{OwnedFiles: []string{file}}, verifyOK: true}
+	s := newState(t, f)
+	s.startup = snapshotStartup([]string{file})
+	rep := &recordingReporter{}
+	s.agent = rep
+
+	push := &types.MessageData{RemoteConfig: &protobufs.AgentRemoteConfig{
+		ConfigHash: []byte("hash-1"),
+		Config:     &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{"k": {Body: []byte("v2\n")}}},
+	}}
+	s.onRemoteConfig(context.Background(), push)
+	if n := len(rep.statuses); n != 1 || rep.statuses[0].Status != applied {
+		t.Fatalf("first push must report once as APPLIED: %d statuses", n)
+	}
+	// The same hash again: skipped (no re-apply) but still reported, so the
+	// server sees "already applied" instead of marking the revision
+	// unconfirmed / keeping a stale FAILED status.
+	s.onRemoteConfig(context.Background(), push)
+	if n := len(rep.statuses); n != 2 {
+		t.Fatalf("the skipped re-push must still report status, got %d reports", n)
+	}
+	last := rep.statuses[1]
+	if last.Status != applied || string(last.LastRemoteConfigHash) != "hash-1" || last.ErrorMessage != "" {
+		t.Fatalf("skip status must be APPLIED for the same hash, no error: %+v", last)
+	}
+	if f.applyCalls != 1 {
+		t.Fatalf("skip must not re-apply (apply calls: %d)", f.applyCalls)
+	}
+}
+
+func TestNoHashSkipsSilently(t *testing.T) {
+	f := &fakeDriver{}
+	s := newState(t, f)
+	rep := &recordingReporter{}
+	s.agent = rep
+	s.onRemoteConfig(context.Background(), &types.MessageData{RemoteConfig: &protobufs.AgentRemoteConfig{
+		Config: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{"k": {Body: []byte("x")}}},
+	}})
+	if len(rep.statuses) != 0 {
+		t.Fatalf("no hash means nothing to report: %d statuses", len(rep.statuses))
 	}
 }
